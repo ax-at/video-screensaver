@@ -783,6 +783,41 @@ restore_gnome_shortcuts() {
     log "INFO" "GNOME shortcuts restored from backup"
 }
 
+get_connected_monitors() {
+    # Try to get monitor information using various methods
+    local monitors=()
+    
+    # Method 1: Try using xrandr (works for both X11 and some Wayland compositors)
+    if command -v xrandr &>/dev/null; then
+        local xrandr_output
+        xrandr_output=$(xrandr --listmonitors 2>/dev/null || echo "")
+        
+        if [[ -n "$xrandr_output" ]]; then
+            # Parse xrandr output: "0: +*HDMI-1 1920/531x1080/299+0+0  HDMI-1"
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^[[:space:]]*[0-9]+: ]]; then
+                    # Extract monitor name (last field)
+                    local monitor_name
+                    monitor_name=$(echo "$line" | awk '{print $NF}')
+                    if [[ -n "$monitor_name" ]]; then
+                        monitors+=("$monitor_name")
+                    fi
+                fi
+            done <<< "$xrandr_output"
+        fi
+    fi
+    
+    # If we found monitors, return them
+    if [[ ${#monitors[@]} -gt 0 ]]; then
+        printf '%s\n' "${monitors[@]}"
+        return 0
+    fi
+    
+    # Fallback: Return empty (will display on primary monitor only)
+    log "WARN" "Could not detect monitors, will display on primary monitor only"
+    return 1
+}
+
 start_screensaver() {
     if [[ -n "$SCREENSAVER_PID" ]]; then
         log "WARN" "Screensaver already running (PID: $SCREENSAVER_PID)"
@@ -909,47 +944,113 @@ Print ignore
 Pause ignore
 EOF
     
-    log "INFO" "Starting screensaver: mpv $VIDEO_PATH"
+    # Get list of connected monitors
+    local monitors=()
+    while IFS= read -r monitor; do
+        monitors+=("$monitor")
+    done < <(get_connected_monitors)
     
-    # Start mpv with flags to keep it on top
-    (
-        mpv "$VIDEO_PATH" \
-            --loop=inf \
-            --fullscreen \
-            --no-border \
-            --hwdec=no \
-            --osc=no \
-            --no-osd-bar \
-            --cursor-autohide=always \
-            --input-conf="$TEMP_INPUT_CONF" \
-            --no-input-default-bindings \
-            --input-vo-keyboard=no \
-            --no-input-cursor \
-            --ontop \
-            --keep-open=no \
-            --window-maximized=yes \
-            --force-window=immediate &
+    local monitor_count=${#monitors[@]}
+    
+    if [[ $monitor_count -eq 0 ]]; then
+        log "INFO" "Starting screensaver on primary monitor: mpv $VIDEO_PATH"
         
-        local mpv_pid=$!
+        # Start mpv on primary monitor (fallback)
+        (
+            mpv "$VIDEO_PATH" \
+                --loop=inf \
+                --fullscreen \
+                --no-border \
+                --hwdec=no \
+                --osc=no \
+                --no-osd-bar \
+                --cursor-autohide=always \
+                --input-conf="$TEMP_INPUT_CONF" \
+                --no-input-default-bindings \
+                --input-vo-keyboard=no \
+                --no-input-cursor \
+                --ontop \
+                --keep-open=no \
+                --window-maximized=yes \
+                --force-window=immediate &
+            
+            local mpv_pid=$!
+            
+            # Give mpv a moment to create the window
+            sleep 1
+            
+            # Use wmctrl to force window properties if available
+            if command -v wmctrl &>/dev/null; then
+                wmctrl -r "mpv" -b add,above,sticky 2>/dev/null || true
+            fi
+            
+            # Use xdotool if available to prevent window from losing focus
+            if command -v xdotool &>/dev/null; then
+                xdotool search --name "mpv" windowactivate 2>/dev/null || true
+            fi
+            
+            # Wait for mpv to finish
+            wait "$mpv_pid"
+        ) &>/dev/null &
+    else
+        log "INFO" "Starting screensaver on $monitor_count monitor(s): ${monitors[*]}"
         
-        # Give mpv a moment to create the window
-        sleep 1
-        
-        # Use wmctrl to force window properties if available
-        if command -v wmctrl &>/dev/null; then
-            # Make window always-on-top and sticky (visible on all desktops)
-            wmctrl -r "mpv" -b add,above,sticky 2>/dev/null || true
-        fi
-        
-        # Use xdotool if available to prevent window from losing focus
-        if command -v xdotool &>/dev/null; then
-            # Focus the mpv window to prevent Alt+Tab from switching away
-            xdotool search --name "mpv" windowactivate 2>/dev/null || true
-        fi
-        
-        # Wait for mpv to finish
-        wait "$mpv_pid"
-    ) &>/dev/null &
+        # Start mpv instance for each monitor
+        (
+            local pids=()
+            
+            for monitor in "${monitors[@]}"; do
+                log "INFO" "Starting mpv on monitor: $monitor"
+                
+                mpv "$VIDEO_PATH" \
+                    --loop=inf \
+                    --fullscreen \
+                    --fs-screen="$monitor" \
+                    --no-border \
+                    --hwdec=no \
+                    --osc=no \
+                    --no-osd-bar \
+                    --cursor-autohide=always \
+                    --input-conf="$TEMP_INPUT_CONF" \
+                    --no-input-default-bindings \
+                    --input-vo-keyboard=no \
+                    --no-input-cursor \
+                    --ontop \
+                    --keep-open=no \
+                    --force-window=immediate &
+                
+                pids+=($!)
+            done
+            
+            # Give mpv instances a moment to create windows
+            sleep 1
+            
+            # Use wmctrl to force window properties if available
+            if command -v wmctrl &>/dev/null; then
+                wmctrl -r "mpv" -b add,above,sticky 2>/dev/null || true
+            fi
+            
+            # Use xdotool if available to prevent windows from losing focus
+            if command -v xdotool &>/dev/null; then
+                while IFS= read -r wid; do
+                    xdotool windowactivate "$wid" 2>/dev/null || true
+                done < <(xdotool search --name "mpv" 2>/dev/null || true)
+            fi
+            
+            # Wait for any mpv to finish (when user presses exit key, all will exit due to shared input conf)
+            wait -n "${pids[@]}"
+            
+            # Kill all remaining mpv instances
+            for pid in "${pids[@]}"; do
+                kill "$pid" 2>/dev/null || true
+            done
+            
+            # Wait for all to finish
+            for pid in "${pids[@]}"; do
+                wait "$pid" 2>/dev/null || true
+            done
+        ) &>/dev/null &
+    fi
     
     SCREENSAVER_PID=$!
     log "INFO" "Screensaver started (PID: $SCREENSAVER_PID)"
