@@ -1,0 +1,1132 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/video-screensaver/config.conf"
+readonly TEMP_INPUT_CONF="/tmp/video-screensaver-input.conf"
+readonly LOG_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/video-screensaver.log"
+
+IDLE_TIMEOUT_MINUTES=5
+EXIT_KEY_COMBO="Ctrl+Alt+c"
+VIDEO_PATH=""
+
+SCREENSAVER_PID=""
+INHIBIT_COOKIE=""
+TEST_MODE=false
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    if [[ "$level" == "ERROR" ]]; then
+        echo "[$timestamp] [$level] $message" >&2
+    fi
+}
+
+get_idle_time() {
+    local output
+    output=$(busctl call --user org.gnome.Mutter.IdleMonitor \
+        /org/gnome/Mutter/IdleMonitor/Core \
+        org.gnome.Mutter.IdleMonitor GetIdletime 2>/dev/null || echo "")
+    
+    if [[ -z "$output" ]]; then
+        log "DEBUG" "Failed to get idle time"
+        echo "0"
+        return 1
+    fi
+    
+    echo "$output" | awk '{print $NF}'
+}
+
+inhibit_screensaver() {
+    local output
+    output=$(busctl call --user org.freedesktop.ScreenSaver \
+        /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver \
+        Inhibit ss "video-screensaver" "Video playing" 2>/dev/null || echo "")
+    
+    if [[ -z "$output" ]]; then
+        log "WARN" "Failed to inhibit screensaver"
+        return 1
+    fi
+    
+    local cookie
+    cookie=$(echo "$output" | awk '{print $NF}')
+    log "INFO" "Inhibited screensaver with cookie: $cookie"
+    echo "$cookie"
+}
+
+uninhibit_screensaver() {
+    local cookie="$1"
+    
+    if [[ -z "$cookie" ]]; then
+        return 0
+    fi
+    
+    busctl call --user org.freedesktop.ScreenSaver \
+        /org/freedesktop/ScreenSaver org.freedesktop.ScreenSaver \
+        UnInhibit u "$cookie" 2>/dev/null || true
+    
+    log "INFO" "Uninhibited screensaver"
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log "DEBUG" "Config file not found at $CONFIG_FILE (using defaults or CLI args)"
+        return 0
+    fi
+    
+    source "$CONFIG_FILE"
+    log "DEBUG" "Config loaded from $CONFIG_FILE"
+}
+
+# File to store original keybindings for restoration
+readonly KEYBINDINGS_BACKUP="/tmp/video-screensaver-keybindings.backup"
+
+# Disable GNOME Shell keyboard shortcuts that interfere with screensaver
+disable_gnome_shortcuts() {
+    log "INFO" "Disabling GNOME keyboard shortcuts..."
+    
+    # Save and disable keybindings
+    {
+        # Super key alone (overlay-key controls whether Super opens Activities)
+        echo "overlay-key=$(gsettings get org.gnome.mutter overlay-key 2>/dev/null || echo "'Super_L'")"
+        
+        # Window switching (Alt+Tab)
+        echo "switch-applications=$(gsettings get org.gnome.desktop.wm.keybindings switch-applications 2>/dev/null || echo "['<Super>Tab', '<Alt>Tab']")"
+        echo "switch-applications-backward=$(gsettings get org.gnome.desktop.wm.keybindings switch-applications-backward 2>/dev/null || echo "['<Shift><Super>Tab', '<Shift><Alt>Tab']")"
+        echo "switch-windows=$(gsettings get org.gnome.desktop.wm.keybindings switch-windows 2>/dev/null || echo "@as []")"
+        echo "switch-windows-backward=$(gsettings get org.gnome.desktop.wm.keybindings switch-windows-backward 2>/dev/null || echo "@as []")"
+        
+        # Activities/Overview (Super key)
+        echo "toggle-overview=$(gsettings get org.gnome.shell.keybindings toggle-overview 2>/dev/null || echo "['<Super>']")"
+        echo "toggle-application-view=$(gsettings get org.gnome.shell.keybindings toggle-application-view 2>/dev/null || echo "['<Super>a']")"
+        
+        # Workspace switching (Ctrl+Alt+Arrow)
+        echo "switch-to-workspace-left=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-left 2>/dev/null || echo "['<Control><Alt>Left']")"
+        echo "switch-to-workspace-right=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-right 2>/dev/null || echo "['<Control><Alt>Right']")"
+        echo "switch-to-workspace-up=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-up 2>/dev/null || echo "['<Control><Alt>Up']")"
+        echo "switch-to-workspace-down=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-down 2>/dev/null || echo "['<Control><Alt>Down']")"
+        
+        # Move window to workspace
+        echo "move-to-workspace-left=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-left 2>/dev/null || echo "['<Control><Shift><Alt>Left']")"
+        echo "move-to-workspace-right=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-right 2>/dev/null || echo "['<Control><Shift><Alt>Right']")"
+        
+        # Panel/message tray
+        echo "toggle-message-tray=$(gsettings get org.gnome.shell.keybindings toggle-message-tray 2>/dev/null || echo "['<Super>v', '<Super>m']")"
+        
+        # Screenshot shortcuts (shell)
+        echo "screenshot=$(gsettings get org.gnome.shell.keybindings screenshot 2>/dev/null || echo "['Print']")"
+        echo "screenshot-window=$(gsettings get org.gnome.shell.keybindings screenshot-window 2>/dev/null || echo "['<Alt>Print']")"
+        echo "show-screenshot-ui=$(gsettings get org.gnome.shell.keybindings show-screenshot-ui 2>/dev/null || echo "['Print']")"
+        
+        # Screenshot shortcuts (settings-daemon/media-keys)
+        echo "media-screenshot=$(gsettings get org.gnome.settings-daemon.plugins.media-keys screenshot 2>/dev/null || echo "['Print']")"
+        echo "media-screenshot-clip=$(gsettings get org.gnome.settings-daemon.plugins.media-keys screenshot-clip 2>/dev/null || echo "['<Ctrl>Print']")"
+        echo "media-window-screenshot=$(gsettings get org.gnome.settings-daemon.plugins.media-keys window-screenshot 2>/dev/null || echo "['<Alt>Print']")"
+        echo "media-window-screenshot-clip=$(gsettings get org.gnome.settings-daemon.plugins.media-keys window-screenshot-clip 2>/dev/null || echo "['<Ctrl><Alt>Print']")"
+        echo "media-area-screenshot=$(gsettings get org.gnome.settings-daemon.plugins.media-keys area-screenshot 2>/dev/null || echo "['<Shift>Print']")"
+        echo "media-area-screenshot-clip=$(gsettings get org.gnome.settings-daemon.plugins.media-keys area-screenshot-clip 2>/dev/null || echo "['<Ctrl><Shift>Print']")"
+        
+        # Screen lock
+        echo "screensaver=$(gsettings get org.gnome.settings-daemon.plugins.media-keys screensaver 2>/dev/null || echo "['<Super>l']")"
+        
+        # Logout (Ctrl+Alt+Delete)
+        echo "logout=$(gsettings get org.gnome.settings-daemon.plugins.media-keys logout 2>/dev/null || echo "['<Control><Alt>Delete']")"
+        
+        # Focus shortcuts
+        echo "focus-active-notification=$(gsettings get org.gnome.shell.keybindings focus-active-notification 2>/dev/null || echo "['<Super>n']")"
+        
+        # Media keys (function keys)
+        echo "media-volume-up=$(gsettings get org.gnome.settings-daemon.plugins.media-keys volume-up 2>/dev/null || echo "['XF86AudioRaiseVolume']")"
+        echo "media-volume-down=$(gsettings get org.gnome.settings-daemon.plugins.media-keys volume-down 2>/dev/null || echo "['XF86AudioLowerVolume']")"
+        echo "media-volume-mute=$(gsettings get org.gnome.settings-daemon.plugins.media-keys volume-mute 2>/dev/null || echo "['XF86AudioMute']")"
+        echo "media-mic-mute=$(gsettings get org.gnome.settings-daemon.plugins.media-keys mic-mute 2>/dev/null || echo "['XF86AudioMicMute']")"
+        echo "media-play=$(gsettings get org.gnome.settings-daemon.plugins.media-keys play 2>/dev/null || echo "['XF86AudioPlay']")"
+        echo "media-pause=$(gsettings get org.gnome.settings-daemon.plugins.media-keys pause 2>/dev/null || echo "['XF86AudioPause']")"
+        echo "media-stop=$(gsettings get org.gnome.settings-daemon.plugins.media-keys stop 2>/dev/null || echo "['XF86AudioStop']")"
+        echo "media-next=$(gsettings get org.gnome.settings-daemon.plugins.media-keys next 2>/dev/null || echo "['XF86AudioNext']")"
+        echo "media-previous=$(gsettings get org.gnome.settings-daemon.plugins.media-keys previous 2>/dev/null || echo "['XF86AudioPrev']")"
+        echo "media-eject=$(gsettings get org.gnome.settings-daemon.plugins.media-keys eject 2>/dev/null || echo "['XF86Eject']")"
+        
+        # Brightness keys
+        echo "media-brightness-up=$(gsettings get org.gnome.settings-daemon.plugins.media-keys screen-brightness-up 2>/dev/null || echo "['XF86MonBrightnessUp']")"
+        echo "media-brightness-down=$(gsettings get org.gnome.settings-daemon.plugins.media-keys screen-brightness-down 2>/dev/null || echo "['XF86MonBrightnessDown']")"
+        echo "media-kbd-brightness-up=$(gsettings get org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-up 2>/dev/null || echo "['XF86KbdBrightnessUp']")"
+        echo "media-kbd-brightness-down=$(gsettings get org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-down 2>/dev/null || echo "['XF86KbdBrightnessDown']")"
+        
+        # Other media keys
+        echo "media-www=$(gsettings get org.gnome.settings-daemon.plugins.media-keys www 2>/dev/null || echo "['XF86WWW']")"
+        echo "media-home=$(gsettings get org.gnome.settings-daemon.plugins.media-keys home 2>/dev/null || echo "['XF86Explorer']")"
+        echo "media-search=$(gsettings get org.gnome.settings-daemon.plugins.media-keys search 2>/dev/null || echo "['XF86Search']")"
+        echo "media-email=$(gsettings get org.gnome.settings-daemon.plugins.media-keys email 2>/dev/null || echo "['XF86Mail']")"
+        echo "media-calculator=$(gsettings get org.gnome.settings-daemon.plugins.media-keys calculator 2>/dev/null || echo "['XF86Calculator']")"
+        echo "media-control-center=$(gsettings get org.gnome.settings-daemon.plugins.media-keys control-center 2>/dev/null || echo "['XF86Tools']")"
+        
+        # Help key
+        echo "media-help=$(gsettings get org.gnome.settings-daemon.plugins.media-keys help 2>/dev/null || echo "['', '<Super>F1']")"
+        
+        # Magnifier/accessibility
+        echo "magnifier=$(gsettings get org.gnome.settings-daemon.plugins.media-keys magnifier 2>/dev/null || echo "['<Alt><Super>8']")"
+        echo "magnifier-zoom-in=$(gsettings get org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-in 2>/dev/null || echo "['<Alt><Super>equal']")"
+        echo "magnifier-zoom-out=$(gsettings get org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-out 2>/dev/null || echo "['<Alt><Super>minus']")"
+        echo "screenreader=$(gsettings get org.gnome.settings-daemon.plugins.media-keys screenreader 2>/dev/null || echo "['<Alt><Super>s']")"
+        echo "on-screen-keyboard=$(gsettings get org.gnome.settings-daemon.plugins.media-keys on-screen-keyboard 2>/dev/null || echo "['']")"
+        
+        # F-key related shortcuts (F1-F12)
+        echo "activate-window-menu=$(gsettings get org.gnome.desktop.wm.keybindings activate-window-menu 2>/dev/null || echo "['<Alt>F10']")"
+        echo "toggle-fullscreen=$(gsettings get org.gnome.desktop.wm.keybindings toggle-fullscreen 2>/dev/null || echo "['']")"
+        echo "panel-run-dialog=$(gsettings get org.gnome.desktop.wm.keybindings panel-run-dialog 2>/dev/null || echo "['<Alt>F2']")"
+        echo "close=$(gsettings get org.gnome.desktop.wm.keybindings close 2>/dev/null || echo "['<Alt>F4']")"
+        echo "maximize=$(gsettings get org.gnome.desktop.wm.keybindings maximize 2>/dev/null || echo "['<Super>Up']")"
+        echo "unmaximize=$(gsettings get org.gnome.desktop.wm.keybindings unmaximize 2>/dev/null || echo "['<Super>Down']")"
+        echo "toggle-maximized=$(gsettings get org.gnome.desktop.wm.keybindings toggle-maximized 2>/dev/null || echo "['<Alt>F10']")"
+        echo "minimize=$(gsettings get org.gnome.desktop.wm.keybindings minimize 2>/dev/null || echo "['<Super>h']")"
+        echo "begin-move=$(gsettings get org.gnome.desktop.wm.keybindings begin-move 2>/dev/null || echo "['<Alt>F7']")"
+        echo "begin-resize=$(gsettings get org.gnome.desktop.wm.keybindings begin-resize 2>/dev/null || echo "['<Alt>F8']")"
+        echo "show-desktop=$(gsettings get org.gnome.desktop.wm.keybindings show-desktop 2>/dev/null || echo "['<Super>d']")"
+        echo "cycle-windows=$(gsettings get org.gnome.desktop.wm.keybindings cycle-windows 2>/dev/null || echo "['<Alt>F6']")"
+        echo "cycle-windows-backward=$(gsettings get org.gnome.desktop.wm.keybindings cycle-windows-backward 2>/dev/null || echo "['<Alt><Shift>F6']")"
+        echo "cycle-group=$(gsettings get org.gnome.desktop.wm.keybindings cycle-group 2>/dev/null || echo "['<Alt>F6']")"
+        echo "cycle-group-backward=$(gsettings get org.gnome.desktop.wm.keybindings cycle-group-backward 2>/dev/null || echo "['<Alt><Shift>F6']")"
+        echo "cycle-panels=$(gsettings get org.gnome.desktop.wm.keybindings cycle-panels 2>/dev/null || echo "['<Ctrl><Alt>Escape']")"
+        echo "cycle-panels-backward=$(gsettings get org.gnome.desktop.wm.keybindings cycle-panels-backward 2>/dev/null || echo "['<Shift><Ctrl><Alt>Escape']")"
+        echo "switch-input-source=$(gsettings get org.gnome.desktop.wm.keybindings switch-input-source 2>/dev/null || echo "['<Super>space']")"
+        echo "switch-input-source-backward=$(gsettings get org.gnome.desktop.wm.keybindings switch-input-source-backward 2>/dev/null || echo "['<Shift><Super>space']")"
+        echo "panel-main-menu=$(gsettings get org.gnome.desktop.wm.keybindings panel-main-menu 2>/dev/null || echo "['<Alt>F1']")"
+        echo "open-application-menu=$(gsettings get org.gnome.shell.keybindings open-application-menu 2>/dev/null || echo "['<Super>F10']")"
+        
+        # Switch to specific workspaces (may use Super+F1-F12)
+        echo "switch-to-workspace-1=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-1 2>/dev/null || echo "['<Super>Home']")"
+        echo "switch-to-workspace-2=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-2 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-3=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-3 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-4=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-4 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-5=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-5 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-6=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-6 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-7=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-7 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-8=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-8 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-9=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-9 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-10=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-10 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-11=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-11 2>/dev/null || echo "['']")"
+        echo "switch-to-workspace-12=$(gsettings get org.gnome.desktop.wm.keybindings switch-to-workspace-12 2>/dev/null || echo "['']")"
+        
+        # Move to specific workspaces
+        echo "move-to-workspace-1=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-1 2>/dev/null || echo "['<Super><Shift>Home']")"
+        echo "move-to-workspace-2=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-2 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-3=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-3 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-4=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-4 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-5=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-5 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-6=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-6 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-7=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-7 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-8=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-8 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-9=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-9 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-10=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-10 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-11=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-11 2>/dev/null || echo "['']")"
+        echo "move-to-workspace-12=$(gsettings get org.gnome.desktop.wm.keybindings move-to-workspace-12 2>/dev/null || echo "['']")"
+        
+    } > "$KEYBINDINGS_BACKUP"
+    
+    # ===== DISABLE SUPER KEY (overlay-key) =====
+    gsettings set org.gnome.mutter overlay-key '' 2>/dev/null || true
+    
+    # ===== DISABLE WINDOW SWITCHING =====
+    gsettings set org.gnome.desktop.wm.keybindings switch-applications "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-applications-backward "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-windows "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-windows-backward "[]" 2>/dev/null || true
+    
+    # ===== DISABLE OVERVIEW/ACTIVITIES =====
+    gsettings set org.gnome.shell.keybindings toggle-overview "[]" 2>/dev/null || true
+    gsettings set org.gnome.shell.keybindings toggle-application-view "[]" 2>/dev/null || true
+    
+    # ===== DISABLE WORKSPACE SWITCHING =====
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-up "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-down "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-left "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-right "[]" 2>/dev/null || true
+    
+    # ===== DISABLE MESSAGE TRAY =====
+    gsettings set org.gnome.shell.keybindings toggle-message-tray "[]" 2>/dev/null || true
+    
+    # ===== DISABLE ALL SCREENSHOT SHORTCUTS =====
+    gsettings set org.gnome.shell.keybindings screenshot "[]" 2>/dev/null || true
+    gsettings set org.gnome.shell.keybindings screenshot-window "[]" 2>/dev/null || true
+    gsettings set org.gnome.shell.keybindings show-screenshot-ui "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys screenshot "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys screenshot-clip "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys window-screenshot "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys window-screenshot-clip "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys area-screenshot "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys area-screenshot-clip "[]" 2>/dev/null || true
+    
+    # ===== DISABLE SCREEN LOCK =====
+    gsettings set org.gnome.settings-daemon.plugins.media-keys screensaver "[]" 2>/dev/null || true
+    
+    # ===== DISABLE LOGOUT (Ctrl+Alt+Delete) =====
+    gsettings set org.gnome.settings-daemon.plugins.media-keys logout "[]" 2>/dev/null || true
+    
+    # ===== DISABLE FOCUS SHORTCUTS =====
+    gsettings set org.gnome.shell.keybindings focus-active-notification "[]" 2>/dev/null || true
+    
+    # ===== DISABLE ALL MEDIA/FUNCTION KEYS =====
+    gsettings set org.gnome.settings-daemon.plugins.media-keys volume-up "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys volume-down "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys volume-mute "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys mic-mute "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys play "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys pause "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys stop "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys next "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys previous "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys eject "[]" 2>/dev/null || true
+    
+    # ===== DISABLE BRIGHTNESS KEYS =====
+    gsettings set org.gnome.settings-daemon.plugins.media-keys screen-brightness-up "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys screen-brightness-down "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-up "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-down "[]" 2>/dev/null || true
+    
+    # ===== DISABLE OTHER MEDIA KEYS =====
+    gsettings set org.gnome.settings-daemon.plugins.media-keys www "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys home "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys search "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys email "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys calculator "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys control-center "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys help "[]" 2>/dev/null || true
+    
+    # ===== DISABLE ACCESSIBILITY KEYS =====
+    gsettings set org.gnome.settings-daemon.plugins.media-keys magnifier "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-in "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-out "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys screenreader "[]" 2>/dev/null || true
+    gsettings set org.gnome.settings-daemon.plugins.media-keys on-screen-keyboard "[]" 2>/dev/null || true
+    
+    # ===== DISABLE F1-F12 FUNCTION KEY SHORTCUTS =====
+    # F1 - Help
+    gsettings set org.gnome.settings-daemon.plugins.media-keys help "[]" 2>/dev/null || true
+    # F10 - Window menu
+    gsettings set org.gnome.desktop.wm.keybindings activate-window-menu "[]" 2>/dev/null || true
+    # F11 - Fullscreen toggle
+    gsettings set org.gnome.desktop.wm.keybindings toggle-fullscreen "[]" 2>/dev/null || true
+    # Panel run dialog (often Alt+F2)
+    gsettings set org.gnome.desktop.wm.keybindings panel-run-dialog "[]" 2>/dev/null || true
+    # Close window (Alt+F4)
+    gsettings set org.gnome.desktop.wm.keybindings close "[]" 2>/dev/null || true
+    # Maximize/unmaximize (may use F keys)
+    gsettings set org.gnome.desktop.wm.keybindings maximize "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings unmaximize "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings toggle-maximized "[]" 2>/dev/null || true
+    # Minimize
+    gsettings set org.gnome.desktop.wm.keybindings minimize "[]" 2>/dev/null || true
+    # Move/resize (sometimes use F keys)
+    gsettings set org.gnome.desktop.wm.keybindings begin-move "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings begin-resize "[]" 2>/dev/null || true
+    # Show desktop
+    gsettings set org.gnome.desktop.wm.keybindings show-desktop "[]" 2>/dev/null || true
+    # Cycle windows (F6 in some configs)
+    gsettings set org.gnome.desktop.wm.keybindings cycle-windows "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings cycle-windows-backward "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings cycle-group "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings cycle-group-backward "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings cycle-panels "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings cycle-panels-backward "[]" 2>/dev/null || true
+    # Switch input source (Super+Space or similar, but may use F keys)
+    gsettings set org.gnome.desktop.wm.keybindings switch-input-source "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-input-source-backward "[]" 2>/dev/null || true
+    # Panel shortcuts
+    gsettings set org.gnome.desktop.wm.keybindings panel-main-menu "[]" 2>/dev/null || true
+    # Looking glass (GNOME Shell debug - Alt+F2 lg)
+    gsettings set org.gnome.shell.keybindings open-application-menu "[]" 2>/dev/null || true
+    # Switch to specific workspaces
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-1 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-2 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-3 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-4 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-5 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-6 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-7 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-8 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-9 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-10 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-11 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-12 "[]" 2>/dev/null || true
+    # Move to specific workspaces
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-1 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-2 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-3 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-4 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-5 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-6 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-7 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-8 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-9 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-10 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-11 "[]" 2>/dev/null || true
+    gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-12 "[]" 2>/dev/null || true
+    
+    log "INFO" "GNOME shortcuts disabled (including Super key, media keys, and F-keys)"
+}
+
+# Restore GNOME Shell keyboard shortcuts
+restore_gnome_shortcuts() {
+    log "INFO" "Restoring GNOME keyboard shortcuts..."
+    
+    if [[ ! -f "$KEYBINDINGS_BACKUP" ]]; then
+        log "WARN" "No keybindings backup found, resetting all to defaults"
+        # Reset all settings to their defaults
+        gsettings reset org.gnome.mutter overlay-key 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-applications 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-applications-backward 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-windows 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-windows-backward 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings toggle-overview 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings toggle-application-view 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-left 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-right 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-up 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-down 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-left 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-right 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings toggle-message-tray 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings screenshot 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings screenshot-window 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings show-screenshot-ui 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys screenshot 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys screenshot-clip 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys window-screenshot 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys window-screenshot-clip 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys area-screenshot 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys area-screenshot-clip 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys screensaver 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys logout 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings focus-active-notification 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys volume-up 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys volume-down 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys volume-mute 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys mic-mute 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys play 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys pause 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys stop 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys next 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys previous 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys eject 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys screen-brightness-up 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys screen-brightness-down 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-up 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-down 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys www 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys home 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys search 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys email 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys calculator 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys control-center 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys help 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys magnifier 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-in 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-out 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys screenreader 2>/dev/null || true
+        gsettings reset org.gnome.settings-daemon.plugins.media-keys on-screen-keyboard 2>/dev/null || true
+        # F-key related shortcuts
+        gsettings reset org.gnome.desktop.wm.keybindings activate-window-menu 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings toggle-fullscreen 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings panel-run-dialog 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings close 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings maximize 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings unmaximize 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings toggle-maximized 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings minimize 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings begin-move 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings begin-resize 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings show-desktop 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings cycle-windows 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings cycle-windows-backward 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings cycle-group 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings cycle-group-backward 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings cycle-panels 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings cycle-panels-backward 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-input-source 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-input-source-backward 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings panel-main-menu 2>/dev/null || true
+        gsettings reset org.gnome.shell.keybindings open-application-menu 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-1 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-2 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-3 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-4 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-5 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-6 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-7 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-8 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-9 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-10 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-11 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings switch-to-workspace-12 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-1 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-2 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-3 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-4 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-5 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-6 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-7 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-8 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-9 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-10 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-11 2>/dev/null || true
+        gsettings reset org.gnome.desktop.wm.keybindings move-to-workspace-12 2>/dev/null || true
+        log "INFO" "GNOME shortcuts reset to defaults"
+        return
+    fi
+    
+    # Read backup and restore each setting
+    while IFS='=' read -r key value; do
+        case "$key" in
+            overlay-key)
+                gsettings set org.gnome.mutter overlay-key "$value" 2>/dev/null || true
+                ;;
+            switch-applications)
+                gsettings set org.gnome.desktop.wm.keybindings switch-applications "$value" 2>/dev/null || true
+                ;;
+            switch-applications-backward)
+                gsettings set org.gnome.desktop.wm.keybindings switch-applications-backward "$value" 2>/dev/null || true
+                ;;
+            switch-windows)
+                gsettings set org.gnome.desktop.wm.keybindings switch-windows "$value" 2>/dev/null || true
+                ;;
+            switch-windows-backward)
+                gsettings set org.gnome.desktop.wm.keybindings switch-windows-backward "$value" 2>/dev/null || true
+                ;;
+            toggle-overview)
+                gsettings set org.gnome.shell.keybindings toggle-overview "$value" 2>/dev/null || true
+                ;;
+            toggle-application-view)
+                gsettings set org.gnome.shell.keybindings toggle-application-view "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-left)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-left "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-right)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-right "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-up)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-up "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-down)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-down "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-left)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-left "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-right)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-right "$value" 2>/dev/null || true
+                ;;
+            toggle-message-tray)
+                gsettings set org.gnome.shell.keybindings toggle-message-tray "$value" 2>/dev/null || true
+                ;;
+            screenshot)
+                gsettings set org.gnome.shell.keybindings screenshot "$value" 2>/dev/null || true
+                ;;
+            screenshot-window)
+                gsettings set org.gnome.shell.keybindings screenshot-window "$value" 2>/dev/null || true
+                ;;
+            show-screenshot-ui)
+                gsettings set org.gnome.shell.keybindings show-screenshot-ui "$value" 2>/dev/null || true
+                ;;
+            media-screenshot)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys screenshot "$value" 2>/dev/null || true
+                ;;
+            media-screenshot-clip)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys screenshot-clip "$value" 2>/dev/null || true
+                ;;
+            media-window-screenshot)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys window-screenshot "$value" 2>/dev/null || true
+                ;;
+            media-window-screenshot-clip)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys window-screenshot-clip "$value" 2>/dev/null || true
+                ;;
+            media-area-screenshot)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys area-screenshot "$value" 2>/dev/null || true
+                ;;
+            media-area-screenshot-clip)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys area-screenshot-clip "$value" 2>/dev/null || true
+                ;;
+            screensaver)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys screensaver "$value" 2>/dev/null || true
+                ;;
+            logout)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys logout "$value" 2>/dev/null || true
+                ;;
+            focus-active-notification)
+                gsettings set org.gnome.shell.keybindings focus-active-notification "$value" 2>/dev/null || true
+                ;;
+            media-volume-up)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys volume-up "$value" 2>/dev/null || true
+                ;;
+            media-volume-down)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys volume-down "$value" 2>/dev/null || true
+                ;;
+            media-volume-mute)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys volume-mute "$value" 2>/dev/null || true
+                ;;
+            media-mic-mute)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys mic-mute "$value" 2>/dev/null || true
+                ;;
+            media-play)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys play "$value" 2>/dev/null || true
+                ;;
+            media-pause)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys pause "$value" 2>/dev/null || true
+                ;;
+            media-stop)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys stop "$value" 2>/dev/null || true
+                ;;
+            media-next)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys next "$value" 2>/dev/null || true
+                ;;
+            media-previous)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys previous "$value" 2>/dev/null || true
+                ;;
+            media-eject)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys eject "$value" 2>/dev/null || true
+                ;;
+            media-brightness-up)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys screen-brightness-up "$value" 2>/dev/null || true
+                ;;
+            media-brightness-down)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys screen-brightness-down "$value" 2>/dev/null || true
+                ;;
+            media-kbd-brightness-up)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-up "$value" 2>/dev/null || true
+                ;;
+            media-kbd-brightness-down)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys keyboard-brightness-down "$value" 2>/dev/null || true
+                ;;
+            media-www)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys www "$value" 2>/dev/null || true
+                ;;
+            media-home)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys home "$value" 2>/dev/null || true
+                ;;
+            media-search)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys search "$value" 2>/dev/null || true
+                ;;
+            media-email)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys email "$value" 2>/dev/null || true
+                ;;
+            media-calculator)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys calculator "$value" 2>/dev/null || true
+                ;;
+            media-control-center)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys control-center "$value" 2>/dev/null || true
+                ;;
+            media-help)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys help "$value" 2>/dev/null || true
+                ;;
+            magnifier)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys magnifier "$value" 2>/dev/null || true
+                ;;
+            magnifier-zoom-in)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-in "$value" 2>/dev/null || true
+                ;;
+            magnifier-zoom-out)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys magnifier-zoom-out "$value" 2>/dev/null || true
+                ;;
+            screenreader)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys screenreader "$value" 2>/dev/null || true
+                ;;
+            on-screen-keyboard)
+                gsettings set org.gnome.settings-daemon.plugins.media-keys on-screen-keyboard "$value" 2>/dev/null || true
+                ;;
+            activate-window-menu)
+                gsettings set org.gnome.desktop.wm.keybindings activate-window-menu "$value" 2>/dev/null || true
+                ;;
+            toggle-fullscreen)
+                gsettings set org.gnome.desktop.wm.keybindings toggle-fullscreen "$value" 2>/dev/null || true
+                ;;
+            panel-run-dialog)
+                gsettings set org.gnome.desktop.wm.keybindings panel-run-dialog "$value" 2>/dev/null || true
+                ;;
+            close)
+                gsettings set org.gnome.desktop.wm.keybindings close "$value" 2>/dev/null || true
+                ;;
+            maximize)
+                gsettings set org.gnome.desktop.wm.keybindings maximize "$value" 2>/dev/null || true
+                ;;
+            unmaximize)
+                gsettings set org.gnome.desktop.wm.keybindings unmaximize "$value" 2>/dev/null || true
+                ;;
+            toggle-maximized)
+                gsettings set org.gnome.desktop.wm.keybindings toggle-maximized "$value" 2>/dev/null || true
+                ;;
+            minimize)
+                gsettings set org.gnome.desktop.wm.keybindings minimize "$value" 2>/dev/null || true
+                ;;
+            begin-move)
+                gsettings set org.gnome.desktop.wm.keybindings begin-move "$value" 2>/dev/null || true
+                ;;
+            begin-resize)
+                gsettings set org.gnome.desktop.wm.keybindings begin-resize "$value" 2>/dev/null || true
+                ;;
+            show-desktop)
+                gsettings set org.gnome.desktop.wm.keybindings show-desktop "$value" 2>/dev/null || true
+                ;;
+            cycle-windows)
+                gsettings set org.gnome.desktop.wm.keybindings cycle-windows "$value" 2>/dev/null || true
+                ;;
+            cycle-windows-backward)
+                gsettings set org.gnome.desktop.wm.keybindings cycle-windows-backward "$value" 2>/dev/null || true
+                ;;
+            cycle-group)
+                gsettings set org.gnome.desktop.wm.keybindings cycle-group "$value" 2>/dev/null || true
+                ;;
+            cycle-group-backward)
+                gsettings set org.gnome.desktop.wm.keybindings cycle-group-backward "$value" 2>/dev/null || true
+                ;;
+            cycle-panels)
+                gsettings set org.gnome.desktop.wm.keybindings cycle-panels "$value" 2>/dev/null || true
+                ;;
+            cycle-panels-backward)
+                gsettings set org.gnome.desktop.wm.keybindings cycle-panels-backward "$value" 2>/dev/null || true
+                ;;
+            switch-input-source)
+                gsettings set org.gnome.desktop.wm.keybindings switch-input-source "$value" 2>/dev/null || true
+                ;;
+            switch-input-source-backward)
+                gsettings set org.gnome.desktop.wm.keybindings switch-input-source-backward "$value" 2>/dev/null || true
+                ;;
+            panel-main-menu)
+                gsettings set org.gnome.desktop.wm.keybindings panel-main-menu "$value" 2>/dev/null || true
+                ;;
+            open-application-menu)
+                gsettings set org.gnome.shell.keybindings open-application-menu "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-1)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-1 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-2)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-2 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-3)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-3 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-4)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-4 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-5)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-5 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-6)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-6 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-7)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-7 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-8)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-8 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-9)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-9 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-10)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-10 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-11)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-11 "$value" 2>/dev/null || true
+                ;;
+            switch-to-workspace-12)
+                gsettings set org.gnome.desktop.wm.keybindings switch-to-workspace-12 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-1)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-1 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-2)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-2 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-3)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-3 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-4)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-4 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-5)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-5 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-6)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-6 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-7)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-7 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-8)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-8 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-9)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-9 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-10)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-10 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-11)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-11 "$value" 2>/dev/null || true
+                ;;
+            move-to-workspace-12)
+                gsettings set org.gnome.desktop.wm.keybindings move-to-workspace-12 "$value" 2>/dev/null || true
+                ;;
+        esac
+    done < "$KEYBINDINGS_BACKUP"
+    
+    rm -f "$KEYBINDINGS_BACKUP"
+    log "INFO" "GNOME shortcuts restored from backup"
+}
+
+start_screensaver() {
+    if [[ -n "$SCREENSAVER_PID" ]]; then
+        log "WARN" "Screensaver already running (PID: $SCREENSAVER_PID)"
+        return 1
+    fi
+    
+    # Disable GNOME shortcuts to prevent window switching, overview, etc.
+    disable_gnome_shortcuts
+    
+    # Create input.conf with ONLY the exit key binding
+    # All other keys are explicitly ignored
+    cat > "$TEMP_INPUT_CONF" << EOF
+# Only allow the exit key combination, ignore everything else
+$EXIT_KEY_COMBO quit
+
+# Disable all mouse input
+MOUSE_BTN0 ignore
+MOUSE_BTN1 ignore
+MOUSE_BTN2 ignore
+MOUSE_BTN3 ignore
+MOUSE_BTN4 ignore
+MOUSE_BTN5 ignore
+MOUSE_BTN6 ignore
+WHEEL_UP ignore
+WHEEL_DOWN ignore
+WHEEL_LEFT ignore
+WHEEL_RIGHT ignore
+
+# Disable common keyboard shortcuts (playback/navigation)
+q ignore
+ESC ignore
+SPACE ignore
+ENTER ignore
+p ignore
+s ignore
+f ignore
+m ignore
+o ignore
+i ignore
+j ignore
+l ignore
+k ignore
+. ignore
+, ignore
+
+# Disable function keys (F1-F12)
+F1 ignore
+F2 ignore
+F3 ignore
+F4 ignore
+F5 ignore
+F6 ignore
+F7 ignore
+F8 ignore
+F9 ignore
+F10 ignore
+F11 ignore
+F12 ignore
+
+# Disable virtual desktop switching (Ctrl+Alt+Left/Right)
+Ctrl+Alt+Left ignore
+Ctrl+Alt+Right ignore
+Ctrl+Alt+Up ignore
+Ctrl+Alt+Down ignore
+
+# Disable Alt-Tab and related
+Alt+Tab ignore
+Ctrl+Alt+Tab ignore
+
+# Disable window management
+Super_L ignore
+Super_R ignore
+Alt ignore
+
+# Disable numeric keypad
+KP0 ignore
+KP1 ignore
+KP2 ignore
+KP3 ignore
+KP4 ignore
+KP5 ignore
+KP6 ignore
+KP7 ignore
+KP8 ignore
+KP9 ignore
+KP_Decimal ignore
+KP_Add ignore
+KP_Subtract ignore
+KP_Multiply ignore
+KP_Divide ignore
+
+# Disable arrow keys
+Up ignore
+Down ignore
+Left ignore
+Right ignore
+
+# Disable common modifiers + combinations
+Ctrl+q ignore
+Ctrl+w ignore
+Ctrl+a ignore
+Ctrl+s ignore
+Ctrl+z ignore
+Alt+F4 ignore
+
+# Disable media keys
+XF86AudioPlay ignore
+XF86AudioPause ignore
+XF86AudioNext ignore
+XF86AudioPrev ignore
+XF86AudioMute ignore
+XF86AudioRaiseVolume ignore
+XF86AudioLowerVolume ignore
+
+# Disable other common keys
+Home ignore
+End ignore
+Page_Up ignore
+Page_Down ignore
+Delete ignore
+Insert ignore
+Backspace ignore
+Print ignore
+Pause ignore
+EOF
+    
+    log "INFO" "Starting screensaver: mpv $VIDEO_PATH"
+    
+    # Start mpv with flags to keep it on top
+    (
+        mpv "$VIDEO_PATH" \
+            --loop=inf \
+            --fullscreen \
+            --no-border \
+            --hwdec=no \
+            --osc=no \
+            --no-osd-bar \
+            --cursor-autohide=always \
+            --input-conf="$TEMP_INPUT_CONF" \
+            --no-input-default-bindings \
+            --input-vo-keyboard=no \
+            --no-input-cursor \
+            --ontop \
+            --keep-open=no \
+            --window-maximized=yes \
+            --force-window=immediate &
+        
+        local mpv_pid=$!
+        
+        # Give mpv a moment to create the window
+        sleep 1
+        
+        # Use wmctrl to force window properties if available
+        if command -v wmctrl &>/dev/null; then
+            # Make window always-on-top and sticky (visible on all desktops)
+            wmctrl -r "mpv" -b add,above,sticky 2>/dev/null || true
+        fi
+        
+        # Use xdotool if available to prevent window from losing focus
+        if command -v xdotool &>/dev/null; then
+            # Focus the mpv window to prevent Alt+Tab from switching away
+            xdotool search --name "mpv" windowactivate 2>/dev/null || true
+        fi
+        
+        # Wait for mpv to finish
+        wait "$mpv_pid"
+    ) &>/dev/null &
+    
+    SCREENSAVER_PID=$!
+    log "INFO" "Screensaver started (PID: $SCREENSAVER_PID)"
+}
+
+stop_screensaver() {
+    if [[ -z "$SCREENSAVER_PID" ]]; then
+        # Still restore shortcuts even if no PID (safety)
+        restore_gnome_shortcuts
+        return 0
+    fi
+    
+    if kill -0 "$SCREENSAVER_PID" 2>/dev/null; then
+        log "INFO" "Stopping screensaver (PID: $SCREENSAVER_PID)"
+        kill "$SCREENSAVER_PID" 2>/dev/null || true
+        wait "$SCREENSAVER_PID" 2>/dev/null || true
+    fi
+    
+    SCREENSAVER_PID=""
+    
+    if [[ -n "$INHIBIT_COOKIE" ]]; then
+        uninhibit_screensaver "$INHIBIT_COOKIE"
+        INHIBIT_COOKIE=""
+    fi
+    
+    rm -f "$TEMP_INPUT_CONF"
+    
+    # Restore GNOME shortcuts
+    restore_gnome_shortcuts
+}
+
+cleanup() {
+    log "INFO" "Cleaning up..."
+    stop_screensaver
+    # Double-check shortcuts are restored (safety measure)
+    restore_gnome_shortcuts 2>/dev/null || true
+    exit 0
+}
+
+main_loop() {
+    local idle_timeout_ms=$((IDLE_TIMEOUT_MINUTES * 60 * 1000))
+    local crash_backoff_ms=30000
+    local backoff_until=0
+    
+    log "INFO" "Video Screensaver Daemon starting..."
+    
+    while true; do
+        local now
+        now=$(date +%s%N | head -c 13)
+        
+        if (( now < backoff_until )); then
+            log "DEBUG" "In backoff period, waiting..."
+            sleep 5
+            continue
+        fi
+        backoff_until=0
+        
+        local idle_ms
+        idle_ms=$(get_idle_time)
+        
+        log "DEBUG" "Idle time: ${idle_ms}ms"
+        
+        if (( idle_ms >= idle_timeout_ms )) && [[ -z "$SCREENSAVER_PID" ]]; then
+            log "INFO" "Idle threshold reached, launching screensaver..."
+            
+            INHIBIT_COOKIE=$(inhibit_screensaver || echo "")
+            
+            if ! start_screensaver; then
+                log "ERROR" "Failed to launch screensaver"
+            fi
+        fi
+        
+        if [[ -n "$SCREENSAVER_PID" ]]; then
+            # Only stop if mpv process has exited (user pressed exit key)
+            # Do NOT stop on general activity - screensaver is locked!
+            if ! kill -0 "$SCREENSAVER_PID" 2>/dev/null; then
+                log "INFO" "Screensaver process exited (user pressed exit key)"
+                stop_screensaver
+                backoff_until=$((now + crash_backoff_ms))
+            fi
+        fi
+        
+        sleep 1
+    done
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --video)
+                VIDEO_PATH="$2"
+                shift 2
+                ;;
+            --exit-key)
+                EXIT_KEY_COMBO="$2"
+                shift 2
+                ;;
+            --idle-timeout)
+                IDLE_TIMEOUT_MINUTES="$2"
+                shift 2
+                ;;
+            --now|--test)
+                TEST_MODE=true
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: $0 [OPTIONS]"
+                echo ""
+                echo "Options:"
+                echo "  --video <path>           Path to video file (overrides config)"
+                echo "  --exit-key <combo>       Exit key combination (overrides config)"
+                echo "  --idle-timeout <minutes> Idle timeout in minutes (overrides config)"
+                echo "  --now, --test            Start screensaver immediately (no daemon loop)"
+                echo "  -h, --help               Show this help message"
+                echo ""
+                echo "Without --now/--test, runs as a daemon monitoring idle time."
+                echo "With --now/--test, immediately starts the screensaver for testing."
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Usage: $0 [--video <path>] [--exit-key <combo>] [--idle-timeout <minutes>] [--now|--test]" >&2
+                echo "Use --help for more information" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
+trap cleanup SIGTERM SIGINT
+
+parse_args "$@"
+
+if ! load_config; then
+    if [[ -z "$VIDEO_PATH" ]]; then
+        log "ERROR" "Failed to load configuration and no --video argument provided"
+        exit 1
+    fi
+fi
+
+if [[ -z "$VIDEO_PATH" ]]; then
+    log "ERROR" "VIDEO_PATH not set (neither in config nor via --video argument)"
+    exit 1
+fi
+
+if [[ ! -f "$VIDEO_PATH" ]]; then
+    log "ERROR" "Video file not found: $VIDEO_PATH"
+    exit 1
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")"
+log "INFO" "=== Video Screensaver starting ==="
+log "INFO" "Config: idle_timeout=${IDLE_TIMEOUT_MINUTES}min, exit_key=$EXIT_KEY_COMBO, video=$VIDEO_PATH"
+
+if [[ "$TEST_MODE" == true ]]; then
+    log "INFO" "Test mode: Starting screensaver immediately"
+    echo "Starting screensaver in test mode..."
+    echo "Video: $VIDEO_PATH"
+    echo "Exit key: $EXIT_KEY_COMBO"
+    echo ""
+    echo "Press $EXIT_KEY_COMBO to exit the screensaver"
+    echo ""
+    
+    INHIBIT_COOKIE=$(inhibit_screensaver || echo "")
+    
+    if start_screensaver; then
+        # Wait for mpv to exit
+        wait "$SCREENSAVER_PID" 2>/dev/null || true
+        log "INFO" "Screensaver exited"
+    else
+        log "ERROR" "Failed to start screensaver"
+        exit 1
+    fi
+    
+    # Clean up
+    stop_screensaver
+    log "INFO" "Test mode complete"
+else
+    main_loop
+fi
