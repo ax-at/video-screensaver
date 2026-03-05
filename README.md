@@ -7,6 +7,7 @@ A customizable video screensaver for Linux that plays videos using mpv. Pure bas
 - Locked screensaver (ignores all input except exit key)
 - Automatic activation after idle timeout
 - Fullscreen playback with looping
+- Multi-monitor support (displays same video on all connected monitors)
 - GNOME integration
 
 ## Requirements
@@ -87,6 +88,12 @@ Supports any mpv-compatible video format (MP4, WebM, MKV, AVI, MOV, etc.).
 # Disable hardware decoding if needed
 sudo sed -i 's/hwdec=vaapi/hwdec=no/' /etc/mpv/mpv.conf
 ```
+
+**Video only shows on one monitor:**
+- The script automatically detects monitors using `xrandr`
+- If detection fails, install xrandr: `sudo apt install x11-xserver-utils`
+- Check detected monitors: `xrandr --listmonitors`
+- View logs for monitor detection: `tail -f ~/.cache/video-screensaver.log`
 
 **GNOME shortcuts stopped working after crash:**
 ```bash
