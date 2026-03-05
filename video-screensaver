@@ -5,9 +5,12 @@ set -euo pipefail
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/video-screensaver/config.conf"
 readonly TEMP_INPUT_CONF="/tmp/video-screensaver-input.conf"
-readonly LOG_FILE="${XDG_CACHE_HOME:-$HOME/.cache}/video-screensaver.log"
+readonly LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/video-screensaver/logs"
+readonly RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+readonly LOG_FILE="${LOG_DIR}/run_${RUN_ID}.log"
 
 IDLE_TIMEOUT_MINUTES=5
+IDLE_TIMEOUT_SECONDS=0
 EXIT_KEY_COMBO="Ctrl+Alt+c"
 VIDEO_PATH=""
 
@@ -21,7 +24,7 @@ log() {
     local message="$*"
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
     if [[ "$level" == "ERROR" ]]; then
         echo "[$timestamp] [$level] $message" >&2
     fi
@@ -83,12 +86,93 @@ load_config() {
     log "DEBUG" "Config loaded from $CONFIG_FILE"
 }
 
-# File to store original keybindings for restoration
-readonly KEYBINDINGS_BACKUP="/tmp/video-screensaver-keybindings.backup"
+# File to store original keybindings for restoration (use user-specific location)
+readonly KEYBINDINGS_BACKUP="${XDG_RUNTIME_DIR:-/tmp}/video-screensaver-keybindings-$(id -u).backup"
+
+# Ensure full session environment for gsettings (needed when running as daemon)
+# This includes DBUS_SESSION_BUS_ADDRESS, DISPLAY, and WAYLAND_DISPLAY
+ensure_session_environment() {
+    local user_id=$(id -u)
+    local session_pid=""
+    
+    # Find a running GNOME session process to get environment from
+    session_pid=$(pgrep -u "$user_id" -x gnome-session 2>/dev/null | head -1)
+    if [[ -z "${session_pid:-}" ]]; then
+        session_pid=$(pgrep -u "$user_id" -x gnome-shell 2>/dev/null | head -1)
+    fi
+    if [[ -z "${session_pid:-}" ]]; then
+        session_pid=$(pgrep -u "$user_id" gnome-session 2>/dev/null | head -1)
+    fi
+    
+    if [[ -n "${session_pid:-}" ]]; then
+        local environ_file="/proc/${session_pid}/environ"
+        
+        # Import DBUS_SESSION_BUS_ADDRESS if not set
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            local dbus_addr
+            dbus_addr=$(grep -z "^DBUS_SESSION_BUS_ADDRESS=" "$environ_file" 2>/dev/null | cut -d= -f2- | tr -d '\0')
+            if [[ -n "${dbus_addr:-}" ]]; then
+                export DBUS_SESSION_BUS_ADDRESS="$dbus_addr"
+                log "DEBUG" "Imported DBUS_SESSION_BUS_ADDRESS from session: $dbus_addr"
+            fi
+        fi
+        
+        # Import DISPLAY if not set (for X11)
+        if [[ -z "${DISPLAY:-}" ]]; then
+            local display
+            display=$(grep -z "^DISPLAY=" "$environ_file" 2>/dev/null | cut -d= -f2- | tr -d '\0')
+            if [[ -n "${display:-}" ]]; then
+                export DISPLAY="$display"
+                log "DEBUG" "Imported DISPLAY from session: $display"
+            fi
+        fi
+        
+        # Import WAYLAND_DISPLAY if not set (for Wayland)
+        if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+            local wayland_display
+            wayland_display=$(grep -z "^WAYLAND_DISPLAY=" "$environ_file" 2>/dev/null | cut -d= -f2- | tr -d '\0')
+            if [[ -n "${wayland_display:-}" ]]; then
+                export WAYLAND_DISPLAY="$wayland_display"
+                log "DEBUG" "Imported WAYLAND_DISPLAY from session: $wayland_display"
+            fi
+        fi
+        
+        # Import XDG_RUNTIME_DIR if not set (needed for Wayland socket access)
+        if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+            local xdg_runtime
+            xdg_runtime=$(grep -z "^XDG_RUNTIME_DIR=" "$environ_file" 2>/dev/null | cut -d= -f2- | tr -d '\0')
+            if [[ -n "${xdg_runtime:-}" ]]; then
+                export XDG_RUNTIME_DIR="$xdg_runtime"
+                log "DEBUG" "Imported XDG_RUNTIME_DIR from session: $xdg_runtime"
+            fi
+        fi
+    else
+        # Fallback: try D-Bus session file
+        local machine_id=$(dbus-uuidgen --get 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || cat /etc/machine-id)
+        local dbus_file="$HOME/.dbus/session-bus/${machine_id:-unknown}-0"
+        
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && [[ -f "$dbus_file" ]]; then
+            source "$dbus_file"
+            log "DEBUG" "Sourced D-Bus session file: $dbus_file"
+        fi
+    fi
+    
+    # Verify we have what we need
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+        log "WARN" "Could not detect D-Bus session address - gsettings may not work"
+        return 1
+    fi
+    
+    log "DEBUG" "Session environment ready: DBUS=${DBUS_SESSION_BUS_ADDRESS:-unset}, DISPLAY=${DISPLAY:-unset}, WAYLAND=${WAYLAND_DISPLAY:-unset}"
+    return 0
+}
 
 # Disable GNOME Shell keyboard shortcuts that interfere with screensaver
 disable_gnome_shortcuts() {
     log "INFO" "Disabling GNOME keyboard shortcuts..."
+    
+    # Ensure we have full session environment access (don't fail script if detection fails)
+    ensure_session_environment || true
     
     # Save and disable keybindings
     {
@@ -376,6 +460,9 @@ disable_gnome_shortcuts() {
 # Restore GNOME Shell keyboard shortcuts
 restore_gnome_shortcuts() {
     log "INFO" "Restoring GNOME keyboard shortcuts..."
+    
+    # Ensure we have full session environment access (don't fail script if detection fails)
+    ensure_session_environment || true
     
     if [[ ! -f "$KEYBINDINGS_BACKUP" ]]; then
         log "WARN" "No keybindings backup found, resetting all to defaults"
@@ -990,11 +1077,16 @@ cleanup() {
 }
 
 main_loop() {
-    local idle_timeout_ms=$((IDLE_TIMEOUT_MINUTES * 60 * 1000))
+    local idle_timeout_ms
+    if [[ "$IDLE_TIMEOUT_SECONDS" -gt 0 ]]; then
+        idle_timeout_ms=$((IDLE_TIMEOUT_SECONDS * 1000))
+    else
+        idle_timeout_ms=$((IDLE_TIMEOUT_MINUTES * 60 * 1000))
+    fi
     local crash_backoff_ms=30000
     local backoff_until=0
     
-    log "INFO" "Video Screensaver Daemon starting..."
+    log "INFO" "Video Screensaver Daemon starting (idle_timeout_ms=$idle_timeout_ms)..."
     
     while true; do
         local now
@@ -1051,6 +1143,10 @@ parse_args() {
                 IDLE_TIMEOUT_MINUTES="$2"
                 shift 2
                 ;;
+            --idle-timeout-seconds)
+                IDLE_TIMEOUT_SECONDS="$2"
+                shift 2
+                ;;
             --now|--test)
                 TEST_MODE=true
                 shift
@@ -1059,11 +1155,12 @@ parse_args() {
                 echo "Usage: $0 [OPTIONS]"
                 echo ""
                 echo "Options:"
-                echo "  --video <path>           Path to video file (overrides config)"
-                echo "  --exit-key <combo>       Exit key combination (overrides config)"
-                echo "  --idle-timeout <minutes> Idle timeout in minutes (overrides config)"
-                echo "  --now, --test            Start screensaver immediately (no daemon loop)"
-                echo "  -h, --help               Show this help message"
+                echo "  --video <path>                Path to video file (overrides config)"
+                echo "  --exit-key <combo>            Exit key combination (overrides config)"
+                echo "  --idle-timeout <minutes>      Idle timeout in minutes (overrides config)"
+                echo "  --idle-timeout-seconds <sec>  Idle timeout in seconds (overrides minutes)"
+                echo "  --now, --test                 Start screensaver immediately (no daemon loop)"
+                echo "  -h, --help                    Show this help message"
                 echo ""
                 echo "Without --now/--test, runs as a daemon monitoring idle time."
                 echo "With --now/--test, immediately starts the screensaver for testing."
@@ -1081,14 +1178,13 @@ parse_args() {
 
 trap cleanup SIGTERM SIGINT
 
-parse_args "$@"
-
+# Load config FIRST so CLI args can override it
 if ! load_config; then
-    if [[ -z "$VIDEO_PATH" ]]; then
-        log "ERROR" "Failed to load configuration and no --video argument provided"
-        exit 1
-    fi
+    log "DEBUG" "No config file found, will use CLI arguments or defaults"
 fi
+
+# Parse CLI args AFTER config so they can override
+parse_args "$@"
 
 if [[ -z "$VIDEO_PATH" ]]; then
     log "ERROR" "VIDEO_PATH not set (neither in config nor via --video argument)"
@@ -1100,8 +1196,15 @@ if [[ ! -f "$VIDEO_PATH" ]]; then
     exit 1
 fi
 
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$LOG_DIR"
+
+# Ensure session environment is available early (needed for daemon mode)
+# Don't fail if detection doesn't work - we'll try again later
+ensure_session_environment || true
+
 log "INFO" "=== Video Screensaver starting ==="
+log "INFO" "Run ID: $RUN_ID"
+log "INFO" "Log file: $LOG_FILE"
 log "INFO" "Config: idle_timeout=${IDLE_TIMEOUT_MINUTES}min, exit_key=$EXIT_KEY_COMBO, video=$VIDEO_PATH"
 
 if [[ "$TEST_MODE" == true ]]; then
